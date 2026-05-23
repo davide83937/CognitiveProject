@@ -1,5 +1,7 @@
 from typing import Literal
 
+
+from prompts import triage_system_prompt
 from langchain.tools import tool
 from pydantic import BaseModel
 
@@ -22,14 +24,32 @@ def check_daily_number_article(date: str)->int:
 
 @tool
 def schedule_date_for_article(title: str, author:str, date:str)->str:
-    """Schedule date for article
-    Use date format 'YYYY-MM-DD'"""
+    """Schedule date for article.
+    Use date format 'YYYY-MM-DD'.
+    IMPORTANT: Before calling this tool, ALWAYS check the number of articles for that date
+    using 'check_daily_number_article'. If there are already 3 or more articles, DO NOT schedule
+    on that date and look for the next available day."""
+    if date is not DB_ARTICOLI_PUBBLICATI:
+        DB_ARTICOLI_PUBBLICATI[date]=[]
     DB_ARTICOLI_PUBBLICATI[date].append(title)
     return ""
 
-@tool
+
 def triage_email(category: Literal["ignore", "notify", "write_article"]) -> str:
-    """Triage an email into one of three categories: ignore, notify, respond."""
+
+    system_prompt = triage_system_prompt.format(
+        background=default_background,
+        triage_instructions=default_triage_instructions
+    )
+    result = llm_router.invoke(
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+    )
+
+    # Decision
+    classification = result.classification
     return f"Classification Decision: {category}"
 
 @tool

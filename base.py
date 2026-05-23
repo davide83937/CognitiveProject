@@ -18,7 +18,7 @@ def get_tools(tool_names: Optional[List[str]] = None, include_gmail: bool = Fals
 
     # Base tools dictionary
     all_tools = {
-        "write_email": write_an_article,
+        "write_article": write_an_article,
         "schedule_date_article": schedule_date_for_article,
         "check_calendar_availability": check_daily_number_article,
     }

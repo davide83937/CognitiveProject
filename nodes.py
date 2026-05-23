@@ -1,11 +1,15 @@
 import os
-from typing import Optional, List
+from typing import Literal
 
-from langchain_core.tools import BaseTool
+
 from langgraph.constants import END
 from langgraph.graph import MessagesState
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
+from langgraph.types import Command
+from pydantic import BaseModel, Field
+
 from base import get_tools, get_tools_by_name
+from prompts import triage_system_prompt
 from schemas import State
 from tools import write_an_article, schedule_date_for_article, check_daily_number_article
 
@@ -21,12 +25,34 @@ llm_endpoint = HuggingFaceEndpoint(
 )
 
 llm = ChatHuggingFace(llm=llm_endpoint)
-llm_with_tools = llm.bind_tools([write_an_article], tool_choice="any")
+
+llm_with_tools = llm.bind_tools([write_an_article, schedule_date_for_article, check_daily_number_article])
+
+from langchain_core.messages import AIMessage, ToolMessage, HumanMessage
+
+
+def call_llm(state: MessagesState):
+    # Creiamo una copia pulita dei messaggi per non mandare in crash Hugging Face
+    cleaned_messages = []
+
+    for msg in state["messages"]:
+        if isinstance(msg, ToolMessage):
+            # Trasformiamo il messaggio del tool in un messaggio dell'utente simulato,
+            # così il modello vede la risposta senza crashare sulle specifiche dei tool
+            cleaned_messages.append(HumanMessage(content=f"[Risultato del sistema]: {msg.content}"))
+        elif isinstance(msg, AIMessage) and msg.tool_calls:
+            # Rimuoviamo le informazioni grezze di tool_calls dall'AIMessage
+            cleaned_messages.append(AIMessage(content=msg.content if msg.content else "Sto controllando i dati..."))
+        else:
+            cleaned_messages.append(msg)
+
+    risposta = llm_with_tools.invoke(cleaned_messages)
+    return {"messages": [risposta]}
 
 # Il nodo usa direttamente l'llm definito sopra
-def call_llm(state: MessagesState):
+"""def call_llm(state: MessagesState):
     risposta = llm_with_tools.invoke(state["messages"])
-    return {"messages": [risposta]}
+    return {"messages": [risposta]}"""
 
 """Significato: Questo dice all'LLM chi ha generato questo messaggio. Nel mondo dei modelli di chat ci sono 
 quattro ruoli standard: "system" (le regole), "user" (l'utente umano), "assistant" (l'LLM stesso) e "tool" 
@@ -49,8 +75,95 @@ def should_continue(state: State):
                 return END
             else:
                 return "action"
+    return END
 
+class RouterSchema(BaseModel):
+    """Analyze the unread email and route it according to its content."""
+    # --- IL TRUCCO DEL "CHAIN OF THOUGHT" (Catena di pensieri) ---
+    # Obblighiamo l'LLM a spiegare il suo ragionamento PRIMA di dare la classificazione.
+    # Scrivere i passaggi logici lo costringe a "riflettere", riducendo le
+    # allucinazioni e migliorando drasticamente la precisione della scelta.
+    # Dico all'LLM di pensare ad alta voce
+    ragionamento: str = Field(
+        description="Analizza il topic. Spiega se ha una base scientifica, se è troppo generico o se è completamente fuori tema."
+    )
 
+    # --- IL BINARIO RIGIDO PER IL ROUTER (Output Strutturato) ---
+    # Usiamo 'Literal' per impedire all'LLM di inventarsi risposte o aggiungere chiacchiere.
+    # Il modello è COSTRETTO a restituire ESATTAMENTE una di queste 3 parole chiave.
+    # Così i nostri 'if' nel grafo (es. if classification == "respond":) non si rompono mai.
+    # Do all'LLM il menu a tendina e gli spiego quando usare ogni opzione
+    classification: Literal["accept", "refine", "reject"] = Field(
+        description="Scegli 'accept' se il topic è pronto e specifico. "
+                    "Scegli 'refine' se è scientifico ma troppo vago e necessita di focus. "
+                    "Scegli 'reject' se non ha nulla a che fare con la scienza."
+    )
+from langchain_core.output_parsers import PydanticOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+#llm_router = llm.with_structured_output(RouterSchema) SBLOCCA QUANDO PASSI A OPEN IA
+
+# 1. Inizializza il parser con il tuo schema
+parser = PydanticOutputParser(pydantic_object=RouterSchema)
+
+# 2. Recupera le istruzioni che spiegano al modello come formattare il JSON
+format_instructions = parser.get_format_instructions()
+
+# 3. Crea il prompt.
+# NOTA: Devi includere {format_instructions} nel prompt di sistema
+# e passare il contesto (es. l'email o la query) dell'utente.
+router_prompt = ChatPromptTemplate.from_messages([
+    ("system", "Sei un router intelligente. Il tuo compito è analizzare la richiesta e decidere la prossima mossa.\n\n{format_instructions}"),
+    ("human", "{input}") # Qui andrà il testo che il modello deve valutare
+])
+
+# 4. Crea la chain collegando Prompt -> LLM -> Parser
+llm_router = router_prompt | llm | parser
+
+def triage_prompt(state: State) -> Command[Literal["response_agent", "__end__"]]:
+
+    system_prompt = triage_system_prompt.format(
+        background="Ciao compare, ",
+        triage_instructions=""
+    )
+
+    user_prompt = state["prompt_input"]
+
+    result = llm_router.invoke(
+        {
+            "istruzioni_personalizzate": system_prompt,
+            "format_instructions": format_instructions,
+            "input": user_prompt
+        }
+    )
+
+    classification = result.classification
+
+    if classification == "accept":
+        print("📧 Classification: ACCEPT - An article can be written about this topic")
+        goto = "response_agent"
+        # Add the email to the messages
+        update = {
+            "classification_decision": result.classification,
+            "messages": [{"role": "user",
+                          "content": f"Respond to the email: {user_prompt}"
+                          }],
+        }
+    elif result.classification == "reject":
+        print("🚫 Classification: REJECT - This topic is off-topic")
+        update = {
+            "classification_decision": result.classification,
+        }
+        goto = END
+    elif result.classification == "refine":
+        # If real life, this would do something else
+        print("🔔 Classification: REFINE - This topic is too generic, it needs to be refined")
+        update = {
+            "classification_decision": result.classification,
+        }
+        goto = END
+    else:
+        raise ValueError(f"Invalid classification: {result.classification}")
+    return Command(goto=goto, update=update)
 
 """
 state = {

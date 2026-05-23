@@ -1,7 +1,7 @@
 {
   "dependencies": ["."],
   "graphs": {
-    "event_planner": "./main.py:app"
+    "event_planner": "./main.py:topic_assistant"
   },
   "env": ".env"
 }
