@@ -35,22 +35,6 @@ def schedule_date_for_article(title: str, author:str, date:str)->str:
     return ""
 
 
-def triage_email(category: Literal["ignore", "notify", "write_article"]) -> str:
-
-    system_prompt = triage_system_prompt.format(
-        background=default_background,
-        triage_instructions=default_triage_instructions
-    )
-    result = llm_router.invoke(
-        [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-    )
-
-    # Decision
-    classification = result.classification
-    return f"Classification Decision: {category}"
 
 @tool
 class Done(BaseModel):

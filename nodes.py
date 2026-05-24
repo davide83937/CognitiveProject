@@ -1,16 +1,13 @@
 import os
 from typing import Literal
-
-
 from langgraph.constants import END
 from langgraph.graph import MessagesState
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
-from langgraph.types import Command
+from langgraph.types import Command, interrupt
 from pydantic import BaseModel, Field
-
 from base import get_tools, get_tools_by_name
 from prompts import triage_system_prompt
-from schemas import State
+from schemas import State, HumanFeedbackSchema
 from tools import write_an_article, schedule_date_for_article, check_daily_number_article
 
 # Token e configurazione modello
@@ -25,7 +22,6 @@ llm_endpoint = HuggingFaceEndpoint(
 )
 
 llm = ChatHuggingFace(llm=llm_endpoint)
-
 llm_with_tools = llm.bind_tools([write_an_article, schedule_date_for_article, check_daily_number_article])
 
 from langchain_core.messages import AIMessage, ToolMessage, HumanMessage
@@ -145,7 +141,7 @@ def triage_prompt(state: State) -> Command[Literal["response_agent", "__end__"]]
         update = {
             "classification_decision": result.classification,
             "messages": [{"role": "user",
-                          "content": f"Respond to the email: {user_prompt}"
+                          "content": f"Write an article: {user_prompt}"
                           }],
         }
     elif result.classification == "reject":
@@ -157,13 +153,82 @@ def triage_prompt(state: State) -> Command[Literal["response_agent", "__end__"]]
     elif result.classification == "refine":
         # If real life, this would do something else
         print("🔔 Classification: REFINE - This topic is too generic, it needs to be refined")
+        goto = "response_agent"  # Invece di END, lo mandiamo all'agente
+
+        # Istruiamo l'agente a chiederti chiarimenti invece di scrivere l'articolo
         update = {
             "classification_decision": result.classification,
+            "messages": [{"role": "user",
+                          "content": f"L'argomento '{user_prompt}' è troppo generico. Fai una breve proposta all'utente su come potrebbe restringerlo (es. droni militari, droni per consegne, IA nei droni) e chiedigli cosa preferisce."
+                          }],
         }
-        goto = END
     else:
         raise ValueError(f"Invalid classification: {result.classification}")
     return Command(goto=goto, update=update)
+
+
+# Creiamo il parser e il prompt collegato all'LLM
+feedback_parser = PydanticOutputParser(pydantic_object=HumanFeedbackSchema)
+
+feedback_prompt = ChatPromptTemplate.from_messages([
+    ("system", "Sei un analista. Il tuo compito è capire se l'utente sta approvando l'azione proposta o se chiede delle modifiche.\n\n{format_instructions}"),
+    ("human", "Feedback utente: {feedback}")
+])
+
+# Questa è la chain che "pensa"
+llm_feedback_analyzer = feedback_prompt | llm | feedback_parser
+
+
+def human_review_node(state: MessagesState):
+    """Nodo che mette in pausa il grafo per l'approvazione umana."""
+    last_message = state["messages"][-1]
+
+    # 1. Raccogliamo quello che l'LLM vuole fare
+    tools_richiesti = last_message.tool_calls
+    testo_proposto = last_message.content
+
+    # 2. Creiamo il pacchetto di informazioni
+    dati_da_controllare = {
+        "testo": testo_proposto,
+        "tools": tools_richiesti
+    }
+
+    # 3. INTERRUPT: Qui il codice si FREEZA e aspetta la stringa utente
+    risposta_utente = interrupt(dati_da_controllare)
+
+    # 4. CHIAMIAMO L'LLM per analizzare la risposta dell'utente!
+    print(f"L'utente ha detto: '{risposta_utente}'. Faccio analizzare all'LLM...")
+
+    analisi = llm_feedback_analyzer.invoke({
+        "format_instructions": feedback_parser.get_format_instructions(),
+        "feedback": risposta_utente
+    })
+
+    # 5. Analizziamo l'oggetto Pydantic restituito dall'LLM
+    if analisi.approve:
+        # Se l'LLM ha capito che approvi, proseguiamo
+        print("✅ L'LLM ha confermato l'approvazione.")
+        return {"messages": []}
+    else:
+        # Se l'LLM ha capito che vuoi modifiche, le mandiamo indietro
+        print(f"🔄 L'LLM ha rilevato modifiche: {analisi.modifiche}")
+        feedback = HumanMessage(
+            content=f"L'utente ha bloccato l'azione e ha richiesto queste modifiche: {analisi.modifiche}"
+        )
+        return {"messages": [feedback]}
+
+
+def after_human(state: MessagesState):
+    """Decide dove andare dopo il controllo umano."""
+    last_message = state["messages"][-1]
+
+    # Se l'ultimo messaggio è un "HumanMessage", vuol dire che hai chiesto modifiche!
+    if isinstance(last_message, HumanMessage):
+        return "call_llm"  # Torna all'LLM per far correggere il tiro
+
+    # Altrimenti (hai approvato), procedi a chiamare il tool
+    return "call_tool"
+
 
 """
 state = {
