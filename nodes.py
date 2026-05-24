@@ -1,5 +1,7 @@
 import os
 from typing import Literal
+
+from langchain_core.runnables import RunnableLambda
 from langgraph.constants import END
 from langgraph.graph import MessagesState
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
@@ -112,9 +114,20 @@ router_prompt = ChatPromptTemplate.from_messages([
     ("human", "{input}") # Qui andrà il testo che il modello deve valutare
 ])
 
-# 4. Crea la chain collegando Prompt -> LLM -> Parser
-llm_router = router_prompt | llm | parser
 
+def clean_llm_json_output(message) -> str:
+    # L'LLM restituisce un AIMessage, estraiamo il testo
+    text = message.content if isinstance(message, AIMessage) else str(message)
+
+    # Rimuoviamo l'escape non valido sostituendo \' con un semplice '
+    cleaned_text = text.replace("\\'", "'")
+
+    # Se noti altri errori comuni (es. sfumature di formattazione), puoi aggiungerli qui
+    return cleaned_text
+
+
+# 2. Aggiorna la chain inserendo la funzione RunnableLambda in mezzo
+llm_router = router_prompt | llm | RunnableLambda(clean_llm_json_output) | parser
 def triage_prompt(state: State) -> Command[Literal["response_agent", "__end__"]]:
 
     system_prompt = triage_system_prompt.format(
@@ -208,6 +221,8 @@ def human_review_node(state: MessagesState):
     if analisi.approve:
         # Se l'LLM ha capito che approvi, proseguiamo
         print("✅ L'LLM ha confermato l'approvazione.")
+        if not tools_richiesti:
+            return {"messages": [HumanMessage(content=f"L'utente ha confermato/scelto: {risposta_utente}")]}
         return {"messages": []}
     else:
         # Se l'LLM ha capito che vuoi modifiche, le mandiamo indietro
