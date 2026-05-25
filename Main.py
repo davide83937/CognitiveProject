@@ -13,7 +13,8 @@ workflow.add_node("call_tool", tool_node)
 
 workflow.add_edge(START, "call_llm")
 workflow.add_conditional_edges("call_llm", should_continue,{
-    "action": "human_review",
+    "action": "human_review",       # Tool pericolosi -> Pausa umana
+    "auto_tool": "call_tool",       # Tool sicuri -> Esecuzione immediata
     END: END,
   },
 )

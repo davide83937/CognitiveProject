@@ -32,18 +32,18 @@ from langchain_core.messages import AIMessage, ToolMessage, HumanMessage
 def call_llm(state: MessagesState):
     # Creiamo una copia pulita dei messaggi per non mandare in crash Hugging Face
     cleaned_messages = []
-
     for msg in state["messages"]:
         if isinstance(msg, ToolMessage):
             # Trasformiamo il messaggio del tool in un messaggio dell'utente simulato,
             # così il modello vede la risposta senza crashare sulle specifiche dei tool
             cleaned_messages.append(HumanMessage(content=f"[Risultato del sistema]: {msg.content}"))
         elif isinstance(msg, AIMessage) and msg.tool_calls:
-            # Rimuoviamo le informazioni grezze di tool_calls dall'AIMessage
-            cleaned_messages.append(AIMessage(content=msg.content if msg.content else "Sto controllando i dati..."))
+            dettagli_tool = ", ".join([f"{tc['name']} (Dati: {tc['args']})" for tc in msg.tool_calls])
+            testo_base = msg.content if msg.content else "Elaborazione in corso..."
+            cleaned_messages.append(
+                AIMessage(content=f"{testo_base}\n[Azione proposta in precedenza]: {dettagli_tool}"))
         else:
             cleaned_messages.append(msg)
-
     risposta = llm_with_tools.invoke(cleaned_messages)
     return {"messages": [risposta]}
 
@@ -71,6 +71,9 @@ def should_continue(state: State):
         for tool_call in last_message.tool_calls:
             if tool_call["name"] == "Done":
                 return END
+            elif tool_call["name"] == "check_daily_number_article":
+                # Questa parola chiave salterà il nodo umano
+                return "auto_tool"
             else:
                 return "action"
     return END
@@ -91,10 +94,11 @@ class RouterSchema(BaseModel):
     # Il modello è COSTRETTO a restituire ESATTAMENTE una di queste 3 parole chiave.
     # Così i nostri 'if' nel grafo (es. if classification == "respond":) non si rompono mai.
     # Do all'LLM il menu a tendina e gli spiego quando usare ogni opzione
-    classification: Literal["accept", "refine", "reject"] = Field(
-        description="Scegli 'accept' se il topic è pronto e specifico. "
+    classification: Literal["accept", "refine", "reject", "admin"] = Field(
+        description="Scegli 'accept' se l'argomento è minimamente focalizzato. Non essere troppo severo, accetta anche argomenti di media specificità. "
                     "Scegli 'refine' se è scientifico ma troppo vago e necessita di focus. "
                     "Scegli 'reject' se non ha nulla a che fare con la scienza."
+                    "Scegli 'admin' se l'utente fa domande sull'agenda, sulle date disponibili o sull'organizzazione, senza chiedere di scrivere un articolo. "
     )
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import ChatPromptTemplate
@@ -110,8 +114,16 @@ format_instructions = parser.get_format_instructions()
 # NOTA: Devi includere {format_instructions} nel prompt di sistema
 # e passare il contesto (es. l'email o la query) dell'utente.
 router_prompt = ChatPromptTemplate.from_messages([
-    ("system", "Sei un router intelligente. Il tuo compito è analizzare la richiesta e decidere la prossima mossa.\n\n{format_instructions}"),
-    ("human", "{input}") # Qui andrà il testo che il modello deve valutare
+    ("system", (
+        "Sei un router intelligente. Il tuo compito è analizzare la richiesta e decidere la prossima mossa.\n\n"
+        "CONTESTO E REGOLE:\n"
+        "{istruzioni_personalizzate}\n\n"
+        "REGOLE DI FORMATTAZIONE OBBLIGATORIE:\n"
+        "{format_instructions}\n\n"
+        "ATTENZIONE: DEVI rispondere ESCLUSIVAMENTE con un oggetto JSON valido che contenga sia 'ragionamento' che 'classification'. "
+        "NON aggiungere markdown (come ```json), NON aggiungere spiegazioni extra e NON usare lingue diverse dall'italiano."
+    )),
+    ("human", "{input}")
 ])
 
 
@@ -150,10 +162,25 @@ def triage_prompt(state: State) -> Command[Literal["response_agent", "__end__"]]
     if classification == "accept":
         print("📧 Classification: ACCEPT - An article can be written about this topic")
         goto = "response_agent"
+
+        istruzioni_operative = (
+            "Sei un agente esecutivo. Il tuo compito è completare la pubblicazione di un articolo. "
+            "DEVI eseguire questi step IN ORDINE:\n"
+            "1. USA IL TOOL 'write_an_article' per generare e proporre il testo dell'articolo.\n"
+            "2. ATTENDI l'approvazione umana (se richiesta dal sistema).\n"
+            "3. USA IL TOOL 'check_daily_number_article' per controllare quanti articoli ci sono nella data in cui vuoi pubblicare.\n"
+            "4. USA IL TOOL 'schedule_date_for_article' per programmarlo in una data disponibile.\n"
+            "NON saltare nessuno di questi tool e non scrivere mai l'articolo come semplice testo nella chat."
+        )
+
         # Add the email to the messages
         update = {
             "classification_decision": result.classification,
-            "messages": [{"role": "user",
+            "messages": [{
+                    "role": "system",
+                    "content": istruzioni_operative
+                },
+                {"role": "user",
                           "content": f"Write an article: {user_prompt}"
                           }],
         }
@@ -172,8 +199,24 @@ def triage_prompt(state: State) -> Command[Literal["response_agent", "__end__"]]
         update = {
             "classification_decision": result.classification,
             "messages": [{"role": "user",
-                          "content": f"L'argomento '{user_prompt}' è troppo generico. Fai una breve proposta all'utente su come potrebbe restringerlo (es. droni militari, droni per consegne, IA nei droni) e chiedigli cosa preferisce."
+                          "content": f"L'argomento '{user_prompt}' è troppo generico. Fai una breve proposta all'utente su come potrebbe restringerlo e chiedigli cosa preferisce."
                           }],
+        }
+    elif classification == "admin":
+        print("📅 Classification: ADMIN - L'utente vuole informazioni sull'agenda")
+        goto = "response_agent"
+
+        istruzioni_admin = (
+            "Sei un assistente editoriale. L'utente ha fatto una domanda sull'agenda o sulle date. "
+            "Usa il tool 'check_daily_number_article' per verificare le disponibilità e rispondi alla sua domanda in modo cortese."
+        )
+
+        update = {
+            "classification_decision": result.classification,
+            "messages": [
+                {"role": "system", "content": istruzioni_admin},
+                {"role": "user", "content": user_prompt}
+            ],
         }
     else:
         raise ValueError(f"Invalid classification: {result.classification}")
@@ -228,7 +271,11 @@ def human_review_node(state: MessagesState):
         # Se l'LLM ha capito che vuoi modifiche, le mandiamo indietro
         print(f"🔄 L'LLM ha rilevato modifiche: {analisi.modifiche}")
         feedback = HumanMessage(
-            content=f"L'utente ha bloccato l'azione e ha richiesto queste modifiche: {analisi.modifiche}"
+            content=(
+                f"The user rejected the draft and requested these modifications: {analisi.modifiche}. "
+                "CRITICAL INSTRUCTION: You MUST use the 'write_an_article' tool again to submit the revised version. "
+                "DO NOT write the article in plain text."
+            )
         )
         return {"messages": [feedback]}
 
