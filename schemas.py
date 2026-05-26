@@ -10,7 +10,7 @@ class StateInput(TypedDict):
 class State(MessagesState):
     # This state class has the messages key build in
     prompt_input: str
-    classification_decision: Literal["reject", "refine", "accept"]
+    classification_decision: Literal["reject", "refine", "accept", "admin"]
 
 class HumanFeedbackSchema(BaseModel):
     approve: bool = Field(description="Imposta a True se l'utente approva. Imposta a False se chiede modifiche.")

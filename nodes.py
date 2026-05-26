@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from base import get_tools, get_tools_by_name
 from prompts import triage_system_prompt
 from schemas import State, HumanFeedbackSchema
-from tools import write_an_article, schedule_date_for_article, check_daily_number_article
+from tools import write_an_article, schedule_date_for_article, check_daily_number_article, get_available_dates_in_month
 
 # Token e configurazione modello
 os.environ["HUGGINGFACEHUB_API_TOKEN"] = os.getenv("HF_TOKEN")
@@ -24,7 +24,8 @@ llm_endpoint = HuggingFaceEndpoint(
 )
 
 llm = ChatHuggingFace(llm=llm_endpoint)
-llm_with_tools = llm.bind_tools([write_an_article, schedule_date_for_article, check_daily_number_article])
+llm_with_tools = llm.bind_tools([write_an_article, schedule_date_for_article, check_daily_number_article,
+                                 get_available_dates_in_month])
 
 from langchain_core.messages import AIMessage, ToolMessage, HumanMessage
 
@@ -71,7 +72,7 @@ def should_continue(state: State):
         for tool_call in last_message.tool_calls:
             if tool_call["name"] == "Done":
                 return END
-            elif tool_call["name"] == "check_daily_number_article":
+            elif tool_call["name"] == "check_daily_number_article" or tool_call["name"] == "get_available_dates_in_month":
                 # Questa parola chiave salterà il nodo umano
                 return "auto_tool"
             else:
@@ -164,13 +165,12 @@ def triage_prompt(state: State) -> Command[Literal["response_agent", "__end__"]]
         goto = "response_agent"
 
         istruzioni_operative = (
-            "Sei un agente esecutivo. Il tuo compito è completare la pubblicazione di un articolo. "
-            "DEVI eseguire questi step IN ORDINE:\n"
-            "1. USA IL TOOL 'write_an_article' per generare e proporre il testo dell'articolo.\n"
-            "2. ATTENDI l'approvazione umana (se richiesta dal sistema).\n"
-            "3. USA IL TOOL 'check_daily_number_article' per controllare quanti articoli ci sono nella data in cui vuoi pubblicare.\n"
-            "4. USA IL TOOL 'schedule_date_for_article' per programmarlo in una data disponibile.\n"
-            "NON saltare nessuno di questi tool e non scrivere mai l'articolo come semplice testo nella chat."
+            "Sei un assistente editoriale. Il tuo compito è scrivere articoli e aiutare a pubblicarli.\n"
+            "REGOLA D'ORO: Fai UNA cosa alla volta e dialoga con l'utente.\n"
+            "1. DEVI OBBLIGATORIAMENTE USARE IL TOOL 'write_an_article' per proporre l'articolo. INVENTA TU il contenuto (content), l'autore (author) e il destinatario (to). NON SCRIVERE MAI L'ARTICOLO COME SEMPLICE TESTO NELLA CHAT. Se non chiami il tool, il sistema andrà in crash.\n"
+            "2. Attendi che l'utente approvi il testo (ci sarà una pausa umana).\n"
+            "3. SOLO DOPO L'APPROVAZIONE, chiedi all'utente quando desidera pubblicarlo o se vuole conoscere le date libere.\n"
+            "4. Usa i tool sulle date per aiutarlo a scegliere e infine schedula l'articolo."
         )
 
         # Add the email to the messages
@@ -272,9 +272,10 @@ def human_review_node(state: MessagesState):
         print(f"🔄 L'LLM ha rilevato modifiche: {analisi.modifiche}")
         feedback = HumanMessage(
             content=(
-                f"The user rejected the draft and requested these modifications: {analisi.modifiche}. "
-                "CRITICAL INSTRUCTION: You MUST use the 'write_an_article' tool again to submit the revised version. "
-                "DO NOT write the article in plain text."
+                f"L'utente ha rifiutato la proposta o ha richiesto queste modifiche: {analisi.modifiche}. "
+                "CRITICAL INSTRUCTION: Analizza il contesto della conversazione e usa il tool corretto "
+                "(es. 'write_an_article' se devi riscrivere il testo, 'schedule_date_for_article' se devi cambiare data) "
+                "per soddisfare la richiesta. NON rispondere con testo semplice se l'azione richiede un tool."
             )
         )
         return {"messages": [feedback]}

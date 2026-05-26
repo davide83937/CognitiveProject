@@ -40,10 +40,11 @@ overall_workflow = (
 
 topic_assistant = overall_workflow.compile()
 
-"""if __name__ == "__main__":
-    print("Inviando la domanda al grafo locale...")
+if __name__ == "__main__":
+    while True:
+        print("Inviando la domanda al grafo locale...")
+        content = input()
+        output = topic_assistant.invoke({"messages": [{"role": "user", "content": content}]})
 
-    output = app.invoke({"messages": [{"role": "user", "content": "Ciao! Dimmi solo 'Funziona!' se mi senti."}]})
-
-    print("\nRisposta dell'Agente:")
-    print(output["messages"][-1].content)"""
+        print("\nRisposta dell'Agente:")
+        print(output["messages"][-1].content)

@@ -2,6 +2,8 @@ from typing import Optional, List, Dict
 
 from langchain_core.tools import BaseTool
 
+from tools import get_available_dates_in_month
+
 
 def get_tools(tool_names: Optional[List[str]] = None, include_gmail: bool = False) -> List[BaseTool]:
     """Get specified tools or all tools if tool_names is None.
@@ -21,6 +23,7 @@ def get_tools(tool_names: Optional[List[str]] = None, include_gmail: bool = Fals
         "write_article": write_an_article,
         "schedule_date_article": schedule_date_for_article,
         "check_calendar_availability": check_daily_number_article,
+        "get_available_dates_in_month": get_available_dates_in_month,
     }
     if tool_names is None:
         return list(all_tools.values())
