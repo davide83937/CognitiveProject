@@ -1,5 +1,7 @@
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import StateGraph, MessagesState, START, END
+from langgraph.types import Command
+
 # Importiamo la funzione del nodo dal file nodes.py
 from nodes import call_llm, tool_node, should_continue, triage_prompt, human_review_node, after_human
 from schemas import State, StateInput
@@ -41,13 +43,30 @@ overall_workflow = (
 topic_assistant = overall_workflow.compile(checkpointer=memory)
 
 if __name__ == "__main__":
-    config = {"configurable": {"thread_id": "sessione_4"}}
+    # IMPORTANTE: Cambiamo il thread_id in "sessione_5" per partire con
+    # una memoria pulita e non portarci dietro i crash precedenti
+    config = {"configurable": {"thread_id": "sessione_8"}}
+
     while True:
         print("Inviando la domanda al grafo locale...")
         content = input()
-        output = topic_assistant.invoke({"messages": [{"role": "user", "content": content}],
-    "prompt_input": content},
-     config=config)  # <--- Aggiunta della chiave mancante
+
+        # 1. Chiediamo al grafo in che stato si trova attualmente
+        state = topic_assistant.get_state(config)
+
+        # 2. Se 'next' non è vuoto, significa che il grafo è freezato sull'interrupt()
+        if state.next:
+            print("⚙️ Risveglio il grafo in pausa e invio il tuo feedback...")
+            # Usiamo Command(resume=...) per sbloccare l'interrupt e passargli la tua stringa
+            output = topic_assistant.invoke(Command(resume=content), config=config)
+        else:
+            # Se è vuoto, il grafo ha finito ed è pronto per una nuova richiesta normale
+            output = topic_assistant.invoke({
+                "messages": [{"role": "user", "content": content}],
+                "prompt_input": content
+            }, config=config)
 
         print("\nRisposta dell'Agente:")
-        print(output["messages"][-1].content)
+        # Piccolo controllo di sicurezza prima di stampare l'ultimo messaggio
+        if output and "messages" in output and len(output["messages"]) > 0:
+            print(output["messages"][-1].content)

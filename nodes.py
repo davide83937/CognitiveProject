@@ -1,6 +1,8 @@
 import os
 from typing import Literal
 import re
+
+from dotenv import load_dotenv
 from langchain_core.runnables import RunnableLambda
 from langgraph.constants import END
 from langgraph.graph import MessagesState
@@ -11,7 +13,7 @@ from base import get_tools, get_tools_by_name
 from prompts import triage_system_prompt
 from schemas import State, HumanFeedbackSchema
 from tools import write_an_article, schedule_date_for_article, check_daily_number_article, get_available_dates_in_month
-
+load_dotenv()
 # Token e configurazione modello
 os.environ["HUGGINGFACEHUB_API_TOKEN"] = os.getenv("HF_TOKEN")
 from langchain_groq import ChatGroq
@@ -21,13 +23,18 @@ os.environ["GROQ_API_KEY"] = os.getenv("GROQ_TOKEN")
 tools = get_tools()
 tools_by_name = get_tools_by_name(tools)
 
-llm_endpoint = HuggingFaceEndpoint(
+"""llm_endpoint = HuggingFaceEndpoint(
     repo_id="llama3-8b-8192",
     #repo_id="Qwen/Qwen2.5-7B-Instruct",
     task="text-generation",
-)
+)"""
 
-llm = ChatHuggingFace(llm=llm_endpoint)
+#llm = ChatHuggingFace(llm=llm_endpoint)
+# Usiamo direttamente ChatGroq visto che il modello llama3-8b-8192 è ospitato lì
+llm = ChatGroq(
+    model="llama-3.1-8b-instant",
+    temperature=0
+)
 llm_with_tools = llm.bind_tools([write_an_article, schedule_date_for_article, check_daily_number_article,
                                  get_available_dates_in_month])
 
@@ -100,11 +107,15 @@ class RouterSchema(BaseModel):
     # Così i nostri 'if' nel grafo (es. if classification == "respond":) non si rompono mai.
     # Do all'LLM il menu a tendina e gli spiego quando usare ogni opzione
     classification: Literal["accept", "refine", "reject", "admin"] = Field(
-        description="SEGUI RIGOROSAMENTE QUESTE REGOLE: "
-            "- Scegli 'accept' se l'utente propone un argomento scientifico o tecnologico (come droni, nanoparticelle, robotica, IA) chiedendo un articolo. Accetta anche idee specifiche."
-            "- Scegli 'refine' se il tema è scientifico/tecnologico ma immensamente vasto (es. 'parlami di tecnologia', 'medicina generale'). "
-            "- Scegli 'reject' SOLO ED ESCLUSIVAMENTE se l'argomento è palesemente estraneo a scienza e tecnologia (es. ricette di cucina, calcio, gossip). "
-            "- Scegli 'admin' SOLO se l'utente sta chiedendo date, mesi, calendari o disponibilità. ATTENZIONE: SE la richiesta contiene parole come 'scrivi', 'articolo', o propone un tema, NON DEVI MAI USARE 'admin'."
+        description=(
+            "DECISION RULES:\n"
+            "- 'accept': Use this for ANY request that has a clear subject (e.g., 'military stealth drones', 'radar jamming'). "
+            "If the user has already provided details or clarifications, you MUST choose 'accept'. Do not loop.\n"
+            "- 'refine': Use this ONLY if the request is ONE OR TWO words long AND completely vague (e.g., 'drones', 'science'). "
+            "If you have already proposed refinements once, you are forbidden from proposing refinements again. You must choose 'accept'.\n"
+            "- 'reject': Only for off-topic requests.\n"
+            "- 'admin': Only for calendar/date requests."
+        )
     )
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -126,11 +137,16 @@ router_prompt = ChatPromptTemplate.from_messages([
         "CONTESTO E REGOLE:\n"
         "{istruzioni_personalizzate}\n\n"
         "REGOLE DI FORMATTAZIONE OBBLIGATORIE:\n"
-        "{format_instructions}\n\n"
-        "ATTENZIONE: DEVI rispondere ESCLUSIVAMENTE con un oggetto JSON valido che contenga sia 'ragionamento' che 'classification'. "
-        "NON aggiungere markdown (come ```json), NON aggiungere spiegazioni extra e NON usare lingue diverse dall'italiano."
+        "{format_instructions}"
     )),
-    MessagesPlaceholder(variable_name="messages") # <--- Inserisce tutto lo storico della chat!
+    MessagesPlaceholder(variable_name="messages"),  # <--- Storico della chat
+
+    # --- NUOVO BLOCCO: IL RINFORZO FINALE ---
+    ("system", (
+        "PROMEMORIA CRITICO: Hai appena letto la conversazione, ma tu NON sei l'agente che deve rispondere all'utente. "
+        "Tu sei il ROUTER di sistema. DEVI analizzare il contesto e rispondere ESCLUSIVAMENTE con un oggetto JSON valido "
+        "contenente 'ragionamento' e 'classification'. NON aggiungere markdown (come ```json), saluti o spiegazioni extra."
+    ))
 ])
 
 
@@ -179,12 +195,14 @@ def triage_prompt(state: State) -> Command[Literal["response_agent", "__end__"]]
         goto = "response_agent"
 
         istruzioni_operative = (
-            "Sei un assistente editoriale. Il tuo compito è scrivere articoli e aiutare a pubblicarli.\n"
-            "REGOLA D'ORO: Fai UNA cosa alla volta e dialoga con l'utente.\n"
-            "1. DEVI OBBLIGATORIAMENTE USARE IL TOOL 'write_an_article' per proporre l'articolo. INVENTA TU il contenuto (content), l'autore (author) e il destinatario (to). NON SCRIVERE MAI L'ARTICOLO COME SEMPLICE TESTO NELLA CHAT. Se non chiami il tool, il sistema andrà in crash.\n"
-            "2. Attendi che l'utente approvi il testo (ci sarà una pausa umana).\n"
-            "3. SOLO DOPO L'APPROVAZIONE, chiedi all'utente quando desidera pubblicarlo o se vuole conoscere le date libere.\n"
-            "4. Usa i tool sulle date per aiutarlo a scegliere e infine schedula l'articolo."
+            "You are an editorial assistant. Your task is to write articles and help publish them.\n"
+            "GOLDEN RULE: Do one thing at a time and engage with the user.\n"
+            "1. You MUST use the 'write_an_article' tool to propose the article.\n"
+            "Fill in the required fields: 'about' (the topic), 'to' (the target audience), and 'content' (the article text).\n"
+            "STRICT PROHIBITION: Do NOT invent extra parameters (e.g., no 'author', 'title', or 'topic'). Use ONLY the 3 specified parameters.\n"
+            "2. Wait for user approval.\n"
+            "3. ONLY after approval, ask about scheduling or available dates.\n"
+            "4. Use the date tools to help the user schedule the article."
         )
 
         # Add the email to the messages
@@ -210,16 +228,23 @@ def triage_prompt(state: State) -> Command[Literal["response_agent", "__end__"]]
         }
         goto = END
     elif result.classification == "refine":
-        # If real life, this would do something else
         print("🔔 Classification: REFINE - This topic is too generic, it needs to be refined")
-        goto = "response_agent"  # Invece di END, lo mandiamo all'agente
+        goto = "response_agent"
 
-        # Istruiamo l'agente a chiederti chiarimenti invece di scrivere l'articolo
+        istruzioni_refine = (
+            "Sei un assistente editoriale. L'utente ha proposto un argomento troppo generico. "
+            "Il tuo UNICO compito ora è dialogare con l'utente per aiutarlo a restringere il campo. "
+            "IMPORTANTE: NON chiamare ASSOLUTAMENTE nessun tool in questa fase (non usare write_an_article). "
+            "Rispondi solo con testo normale proponendo delle opzioni."
+        )
+
         update = {
             "classification_decision": result.classification,
-            "messages": [{"role": "user",
-                          "content": f"L'argomento '{user_prompt}' è troppo generico. Fai una breve proposta all'utente su come potrebbe restringerlo e chiedigli cosa preferisce."
-                          }],
+            "messages": [
+                {"role": "system", "content": istruzioni_refine},
+                {"role": "user",
+                 "content": f"L'argomento '{user_prompt}' è troppo generico. Fai una breve proposta all'utente su come potrebbe restringerlo e chiedigli cosa preferisce."}
+            ],
         }
     elif classification == "admin":
         print("📅 Classification: ADMIN - L'utente vuole informazioni sull'agenda")
@@ -271,8 +296,7 @@ def human_review_node(state: MessagesState):
             if t["name"] == "write_an_article":
                 print(f"📝 PROPOSTA ARTICOLO:")
                 print(f"Contenuto:\n{t['args'].get('content', 'Nessun testo generato')}")
-                print(f"Autore: {t['args'].get('author', 'N/A')} | Destinatario: {t['args'].get('to', 'N/A')}")
-    if testo_proposto:
+                print(f"Argomento: {t['args'].get('about', 'N/A')} | Destinatario: {t['args'].get('to', 'N/A')}")
         print(f"Messaggio: {testo_proposto}")
     print("=" * 50 + "\n")
     # --- FINE NUOVO BLOCCO ---
