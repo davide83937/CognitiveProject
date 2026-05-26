@@ -32,19 +32,22 @@ app = workflow.compile()
 
 # Build workflow
 overall_workflow = (
-    StateGraph(State, input=StateInput)
+    StateGraph(State, input_schema=StateInput)
     .add_node(triage_prompt)
     .add_node("response_agent", app)
     .add_edge(START, "triage_prompt")
 )
 
-topic_assistant = overall_workflow.compile()
+topic_assistant = overall_workflow.compile(checkpointer=memory)
 
 if __name__ == "__main__":
+    config = {"configurable": {"thread_id": "sessione_4"}}
     while True:
         print("Inviando la domanda al grafo locale...")
         content = input()
-        output = topic_assistant.invoke({"messages": [{"role": "user", "content": content}]})
+        output = topic_assistant.invoke({"messages": [{"role": "user", "content": content}],
+    "prompt_input": content},
+     config=config)  # <--- Aggiunta della chiave mancante
 
         print("\nRisposta dell'Agente:")
         print(output["messages"][-1].content)

@@ -1,6 +1,6 @@
 import os
 from typing import Literal
-
+import re
 from langchain_core.runnables import RunnableLambda
 from langgraph.constants import END
 from langgraph.graph import MessagesState
@@ -14,12 +14,16 @@ from tools import write_an_article, schedule_date_for_article, check_daily_numbe
 
 # Token e configurazione modello
 os.environ["HUGGINGFACEHUB_API_TOKEN"] = os.getenv("HF_TOKEN")
+from langchain_groq import ChatGroq
+
+os.environ["GROQ_API_KEY"] = os.getenv("GROQ_TOKEN")
 
 tools = get_tools()
 tools_by_name = get_tools_by_name(tools)
 
 llm_endpoint = HuggingFaceEndpoint(
-    repo_id="Qwen/Qwen2.5-7B-Instruct",
+    repo_id="llama3-8b-8192",
+    #repo_id="Qwen/Qwen2.5-7B-Instruct",
     task="text-generation",
 )
 
@@ -96,13 +100,15 @@ class RouterSchema(BaseModel):
     # Così i nostri 'if' nel grafo (es. if classification == "respond":) non si rompono mai.
     # Do all'LLM il menu a tendina e gli spiego quando usare ogni opzione
     classification: Literal["accept", "refine", "reject", "admin"] = Field(
-        description="Scegli 'accept' se l'argomento è minimamente focalizzato. Non essere troppo severo, accetta anche argomenti di media specificità. "
-                    "Scegli 'refine' se è scientifico ma troppo vago e necessita di focus. "
-                    "Scegli 'reject' se non ha nulla a che fare con la scienza."
-                    "Scegli 'admin' se l'utente fa domande sull'agenda, sulle date disponibili o sull'organizzazione, senza chiedere di scrivere un articolo. "
+        description="SEGUI RIGOROSAMENTE QUESTE REGOLE: "
+            "- Scegli 'accept' se l'utente propone un argomento scientifico o tecnologico (come droni, nanoparticelle, robotica, IA) chiedendo un articolo. Accetta anche idee specifiche."
+            "- Scegli 'refine' se il tema è scientifico/tecnologico ma immensamente vasto (es. 'parlami di tecnologia', 'medicina generale'). "
+            "- Scegli 'reject' SOLO ED ESCLUSIVAMENTE se l'argomento è palesemente estraneo a scienza e tecnologia (es. ricette di cucina, calcio, gossip). "
+            "- Scegli 'admin' SOLO se l'utente sta chiedendo date, mesi, calendari o disponibilità. ATTENZIONE: SE la richiesta contiene parole come 'scrivi', 'articolo', o propone un tema, NON DEVI MAI USARE 'admin'."
     )
 from langchain_core.output_parsers import PydanticOutputParser
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+
 #llm_router = llm.with_structured_output(RouterSchema) SBLOCCA QUANDO PASSI A OPEN IA
 
 # 1. Inizializza il parser con il tuo schema
@@ -124,7 +130,7 @@ router_prompt = ChatPromptTemplate.from_messages([
         "ATTENZIONE: DEVI rispondere ESCLUSIVAMENTE con un oggetto JSON valido che contenga sia 'ragionamento' che 'classification'. "
         "NON aggiungere markdown (come ```json), NON aggiungere spiegazioni extra e NON usare lingue diverse dall'italiano."
     )),
-    ("human", "{input}")
+    MessagesPlaceholder(variable_name="messages") # <--- Inserisce tutto lo storico della chat!
 ])
 
 
@@ -132,10 +138,18 @@ def clean_llm_json_output(message) -> str:
     # L'LLM restituisce un AIMessage, estraiamo il testo
     text = message.content if isinstance(message, AIMessage) else str(message)
 
-    # Rimuoviamo l'escape non valido sostituendo \' con un semplice '
+    # Rimuoviamo l'escape non valido
     cleaned_text = text.replace("\\'", "'")
 
-    # Se noti altri errori comuni (es. sfumature di formattazione), puoi aggiungerli qui
+    # Usa le regex per trovare il primo '{' e l'ultimo '}' ed estrarre solo il JSON
+    # re.DOTALL permette al punto (.) di matchare anche gli a capo (\n)
+    match = re.search(r'\{.*\}', cleaned_text, re.DOTALL)
+
+    if match:
+        # Restituisce solo la parte della stringa che sembra un JSON
+        return match.group(0)
+
+    # Fallback: se non trova le graffe, restituisce il testo pulito (sperando che il parser lo gestisca o fallisca con grazia)
     return cleaned_text
 
 
@@ -154,7 +168,7 @@ def triage_prompt(state: State) -> Command[Literal["response_agent", "__end__"]]
         {
             "istruzioni_personalizzate": system_prompt,
             "format_instructions": format_instructions,
-            "input": user_prompt
+            "messages": state["messages"] # <--- L'LLM router ora legge la memoria!
         }
     )
 
@@ -188,6 +202,11 @@ def triage_prompt(state: State) -> Command[Literal["response_agent", "__end__"]]
         print("🚫 Classification: REJECT - This topic is off-topic")
         update = {
             "classification_decision": result.classification,
+            # Aggiungiamo un messaggio di risposta dell'agente!
+            "messages": [
+                {"role": "assistant",
+                 "content": "Mi dispiace, ma questo argomento è fuori tema rispetto alle mie competenze. Posso aiutarti solo con argomenti pertinenti, la stesura di articoli o la gestione dell'agenda."}
+            ]
         }
         goto = END
     elif result.classification == "refine":
@@ -242,6 +261,21 @@ def human_review_node(state: MessagesState):
     # 1. Raccogliamo quello che l'LLM vuole fare
     tools_richiesti = last_message.tool_calls
     testo_proposto = last_message.content
+
+    # --- INIZIO NUOVO BLOCCO ---
+    # Stampiamo la proposta dell'LLM prima che il sistema vada in pausa
+    print("\n" + "=" * 50)
+    print("⏳ IN ATTESA DI APPROVAZIONE UMANA ⏳")
+    if tools_richiesti:
+        for t in tools_richiesti:
+            if t["name"] == "write_an_article":
+                print(f"📝 PROPOSTA ARTICOLO:")
+                print(f"Contenuto:\n{t['args'].get('content', 'Nessun testo generato')}")
+                print(f"Autore: {t['args'].get('author', 'N/A')} | Destinatario: {t['args'].get('to', 'N/A')}")
+    if testo_proposto:
+        print(f"Messaggio: {testo_proposto}")
+    print("=" * 50 + "\n")
+    # --- FINE NUOVO BLOCCO ---
 
     # 2. Creiamo il pacchetto di informazioni
     dati_da_controllare = {
